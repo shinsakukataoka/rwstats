@@ -1,0 +1,294 @@
+#include "drmemtrace/analysis_tool.h"
+#include "drmemtrace/memref.h"
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+using namespace dynamorio::drmemtrace;
+
+template <typename K>
+static inline double shannon_entropy(const std::unordered_map<K,uint64_t>& freq, uint64_t total) {
+    if (total == 0) return 0.0;
+    double H = 0.0;
+    for (const auto &kv : freq) {
+        double p = (double)kv.second / (double)total;
+        H -= p * std::log2(p);
+    }
+    return H;
+}
+
+static inline long long env_ll(const char *name, long long defv){
+    const char *s = getenv(name);
+    if (!s || !*s) return defv;
+    char *end = nullptr;
+    long long v = strtoll(s, &end, 10);
+    return (end == s) ? defv : v;
+}
+
+static inline const char* fmt_double(double x, char *buf, size_t n, const char *fmt) {
+    if (std::isnan(x)) return "NaN";
+    snprintf(buf, n, fmt, x);
+    return buf;
+}
+
+template <typename K>
+static inline uint64_t percentile_from_hist(const std::unordered_map<K,uint64_t>& hist,
+                                            uint64_t total_samples, double q) {
+    if (total_samples == 0 || hist.empty()) return 0;
+    uint64_t target = (uint64_t)std::llround(q * (total_samples - 1));
+    std::vector<K> keys; keys.reserve(hist.size());
+    for (auto &kv : hist) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end());
+    uint64_t cum = 0;
+    for (auto &k : keys) {
+        cum += hist.at(k);
+        if (cum > target) return (uint64_t)k;
+    }
+    return (uint64_t)keys.back();
+}
+
+class rwstats_tool_t : public analysis_tool_t {
+public:
+    rwstats_tool_t() {
+        interval_ = (uint64_t)env_ll("RWSTATS_INTERVAL", 0);
+        disable_stride_ = env_ll("RWSTATS_DISABLE_STRIDE", 0) != 0;
+        stride_cap_bytes_ = (uint64_t)env_ll("RWSTATS_STRIDE_CAP_BYTES", 1<<20); // 1MB
+        line_stride_cap_  = (uint64_t)env_ll("RWSTATS_LINESTRIDE_CAP", stride_cap_bytes_ >> 6);
+    }
+
+    bool process_memref(const memref_t &m) override {
+        trace_type_t t = m.data.type;
+        if (t != TRACE_TYPE_READ && t != TRACE_TYPE_WRITE)
+            return true;
+
+        total_++;
+        if (t == TRACE_TYPE_READ)  { reads_++;  bytes_read_  += m.data.size; }
+        else                       { writes_++; bytes_written_ += m.data.size; }
+
+        uintptr_t a = (uintptr_t)m.data.addr;
+        uint64_t line = a >> 6;    // 64B
+        uint64_t page = a >> 12;   // 4KB
+
+        auto &lf = line_freq_[line];
+        reuse_hits_ += (lf > 0);
+        ++lf;
+        ++page_freq_[page];
+
+        if (!disable_stride_) {
+            if (have_prev_) {
+                int64_t d  = (int64_t)a - (int64_t)prev_addr_;
+                uint64_t ad  = (uint64_t)(d < 0 ? -d : d);
+                uint64_t lsd = ad >> 6;
+
+                // clamp for sums *and* histograms
+                uint64_t ad_c  = ad  > stride_cap_bytes_ ? stride_cap_bytes_ : ad;
+                uint64_t lsd_c = lsd > line_stride_cap_  ? line_stride_cap_  : lsd;
+                stride_bytes_over_cap_ += (ad  > stride_cap_bytes_);
+                line_stride_over_cap_  += (lsd > line_stride_cap_);
+
+                // means + rates
+                stride_abs_sum_      += ad_c;
+                stride_line_abs_sum_ += lsd_c;
+                if (ad <= 64) small_stride_++;
+
+                // entropy (signed) + percentile histograms (clamped)
+                ++stride_freq_[d];
+                ++stride_abs_histB_[ad_c];
+                ++line_stride_hist_[lsd_c];
+                stride_pairs_++;
+            } else {
+                have_prev_ = true;
+            }
+            prev_addr_ = a;
+        }
+
+        // Interval
+        if (interval_ > 0) {
+            interval_total_++;
+            auto &ilf = line_freq_int_[line];
+            interval_reuse_hits_ += (ilf > 0);
+            ++ilf;
+            ++page_freq_int_[page];
+
+            if (!disable_stride_) {
+                if (have_prev_int_) {
+                    int64_t d  = (int64_t)a - (int64_t)prev_addr_int_;
+                    uint64_t ad  = (uint64_t)(d < 0 ? -d : d);
+                    uint64_t lsd = ad >> 6;
+
+                    uint64_t ad_c  = ad  > stride_cap_bytes_ ? stride_cap_bytes_ : ad;
+                    uint64_t lsd_c = lsd > line_stride_cap_  ? line_stride_cap_  : lsd;
+                    stride_bytes_over_cap_int_ += (ad  > stride_cap_bytes_);
+                    line_stride_over_cap_int_  += (lsd > line_stride_cap_);
+
+                    stride_abs_sum_int_      += ad_c;
+                    stride_line_abs_sum_int_ += lsd_c;
+                    if (ad <= 64) small_stride_int_++;
+
+                    ++stride_freq_int_[d];
+                    ++stride_abs_histB_int_[ad_c];
+                    ++line_stride_hist_int_[lsd_c];
+                    stride_pairs_int_++;
+                } else {
+                    have_prev_int_ = true;
+                }
+                prev_addr_int_ = a;
+            }
+
+            if (interval_total_ >= interval_) {
+                print_interval(); reset_interval();
+            }
+        }
+        return true;
+    }
+
+    bool print_results() override { print_final(); return true; }
+
+private:
+    void print_line(const char* scope,
+                    uint64_t reads, uint64_t writes,
+                    uint64_t br, uint64_t bw,
+                    const std::unordered_map<uint64_t,uint64_t>& linef,
+                    const std::unordered_map<uint64_t,uint64_t>& pagef,
+                    const std::unordered_map<int64_t,uint64_t>* stridef_signed,
+                    const std::unordered_map<uint64_t,uint64_t>* stride_histB,
+                    const std::unordered_map<uint64_t,uint64_t>* line_stride_hist,
+                    uint64_t total, uint64_t reuse_hits,
+                    uint64_t stride_pairs,
+                    uint64_t stride_abs_sum, uint64_t small_stride,
+                    uint64_t stride_line_abs_sum,
+                    uint64_t stride_bytes_over_cap, uint64_t line_stride_over_cap) {
+
+        double H_line   = shannon_entropy(linef, total);
+        double H_page   = shannon_entropy(pagef, total);
+        double H_stride = stridef_signed ? shannon_entropy(*stridef_signed, stride_pairs)
+                                         : std::numeric_limits<double>::quiet_NaN();
+        double reuse_rate = total ? (double)reuse_hits / (double)total : 0.0;
+
+        double avg_stride      = (stride_pairs == 0) ? std::numeric_limits<double>::quiet_NaN()
+                                                     : (double)stride_abs_sum / (double)stride_pairs;
+        double avg_line_stride = (stride_pairs == 0) ? std::numeric_limits<double>::quiet_NaN()
+                                                     : (double)stride_line_abs_sum / (double)stride_pairs;
+        double p_small         = (stride_pairs == 0) ? std::numeric_limits<double>::quiet_NaN()
+                                                     : (double)small_stride / (double)stride_pairs;
+
+        uint64_t p50B=0,p90B=0,p99B=0,p50L=0,p90L=0,p99L=0;
+        if (stride_histB) {
+            p50B = percentile_from_hist(*stride_histB, stride_pairs, 0.50);
+            p90B = percentile_from_hist(*stride_histB, stride_pairs, 0.90);
+            p99B = percentile_from_hist(*stride_histB, stride_pairs, 0.99);
+        }
+        if (line_stride_hist) {
+            p50L = percentile_from_hist(*line_stride_hist, stride_pairs, 0.50);
+            p90L = percentile_from_hist(*line_stride_hist, stride_pairs, 0.90);
+            p99L = percentile_from_hist(*line_stride_hist, stride_pairs, 0.99);
+        }
+
+        uint64_t uniq_lines = (uint64_t)linef.size();
+        uint64_t uniq_pages = (uint64_t)pagef.size();
+        uint64_t footprint_bytes = uniq_lines * 64;
+
+        char b1[64], b2[64], b3[64], b4[64];
+        fprintf(stderr,
+          "scope=%s,reads=%" PRIu64 ",writes=%" PRIu64
+          ",bytes_read=%" PRIu64 ",bytes_written=%" PRIu64
+          ",uniq_lines=%" PRIu64 ",uniq_pages=%" PRIu64 ",footprint_bytes=%" PRIu64
+          ",H_line=%.6f,H_page=%.6f,H_stride=%s,reuse_rate=%.6f"
+          ",avg_stride=%s,avg_line_stride=%s,p_stride_le_64=%s"
+          ",p50_strideB=%" PRIu64 ",p90_strideB=%" PRIu64 ",p99_strideB=%" PRIu64
+          ",p50_strideL=%" PRIu64 ",p90_strideL=%" PRIu64 ",p99_strideL=%" PRIu64
+          ",stride_bytes_over_cap=%" PRIu64 ",line_stride_over_cap=%" PRIu64 "\n",
+          scope, reads, writes, br, bw,
+          uniq_lines, uniq_pages, footprint_bytes,
+          H_line, H_page,
+          fmt_double(H_stride, b1, sizeof(b1), "%.6f"),
+          reuse_rate,
+          fmt_double(avg_stride, b2, sizeof(b2), "%.1f"),
+          fmt_double(avg_line_stride, b3, sizeof(b3), "%.1f"),
+          fmt_double(p_small, b4, sizeof(b4), "%.6f"),
+          p50B, p90B, p99B, p50L, p90L, p99L,
+          stride_bytes_over_cap, line_stride_over_cap);
+    }
+
+    void print_interval() {
+        print_line("interval",
+          reads_ - reads_at_last_int_, writes_ - writes_at_last_int_,
+          bytes_read_ - br_at_last_int_, bytes_written_ - bw_at_last_int_,
+          line_freq_int_, page_freq_int_,
+          disable_stride_ ? nullptr : &stride_freq_int_,
+          disable_stride_ ? nullptr : &stride_abs_histB_int_,
+          disable_stride_ ? nullptr : &line_stride_hist_int_,
+          interval_total_, interval_reuse_hits_,
+          stride_pairs_int_,
+          stride_abs_sum_int_, small_stride_int_,
+          stride_line_abs_sum_int_,
+          stride_bytes_over_cap_int_, line_stride_over_cap_int_);
+    }
+
+    void reset_interval() {
+        reads_at_last_int_ = reads_;
+        writes_at_last_int_ = writes_;
+        br_at_last_int_ = bytes_read_;
+        bw_at_last_int_ = bytes_written_;
+        interval_total_ = 0;
+        interval_reuse_hits_ = 0;
+        line_freq_int_.clear(); page_freq_int_.clear(); stride_freq_int_.clear();
+        stride_abs_histB_int_.clear(); line_stride_hist_int_.clear();
+        stride_abs_sum_int_ = 0; stride_line_abs_sum_int_ = 0;
+        stride_bytes_over_cap_int_ = 0; line_stride_over_cap_int_ = 0;
+        small_stride_int_ = 0; have_prev_int_ = false; stride_pairs_int_ = 0;
+    }
+
+    void print_final() {
+        print_line("final",
+          reads_, writes_, bytes_read_, bytes_written_,
+          line_freq_, page_freq_,
+          disable_stride_ ? nullptr : &stride_freq_,
+          disable_stride_ ? nullptr : &stride_abs_histB_,
+          disable_stride_ ? nullptr : &line_stride_hist_,
+          total_, reuse_hits_,
+          stride_pairs_,
+          stride_abs_sum_, small_stride_,
+          stride_line_abs_sum_,
+          stride_bytes_over_cap_, line_stride_over_cap_);
+    }
+
+    // global
+    uint64_t reads_ = 0, writes_ = 0, bytes_read_ = 0, bytes_written_ = 0;
+    uint64_t total_ = 0, reuse_hits_ = 0;
+    std::unordered_map<uint64_t,uint64_t> line_freq_, page_freq_;
+    std::unordered_map<int64_t,uint64_t>  stride_freq_; // signed for entropy
+    bool have_prev_ = false; uintptr_t prev_addr_ = 0;
+    uint64_t stride_pairs_ = 0;
+    uint64_t stride_abs_sum_ = 0, stride_line_abs_sum_ = 0;
+    uint64_t small_stride_ = 0;
+    std::unordered_map<uint64_t,uint64_t> stride_abs_histB_;   // clamped
+    std::unordered_map<uint64_t,uint64_t> line_stride_hist_;   // clamped
+    uint64_t stride_bytes_over_cap_ = 0, line_stride_over_cap_ = 0;
+
+    // intervals
+    uint64_t interval_ = 0;
+    uint64_t interval_total_ = 0, interval_reuse_hits_ = 0;
+    std::unordered_map<uint64_t,uint64_t> line_freq_int_, page_freq_int_;
+    std::unordered_map<int64_t,uint64_t>  stride_freq_int_;
+    bool have_prev_int_ = false; uintptr_t prev_addr_int_ = 0;
+    uint64_t stride_pairs_int_ = 0;
+    uint64_t stride_abs_sum_int_ = 0, stride_line_abs_sum_int_ = 0;
+    uint64_t small_stride_int_ = 0;
+    std::unordered_map<uint64_t,uint64_t> stride_abs_histB_int_;
+    std::unordered_map<uint64_t,uint64_t> line_stride_hist_int_;
+    uint64_t stride_bytes_over_cap_int_ = 0, line_stride_over_cap_int_ = 0;
+    uint64_t reads_at_last_int_ = 0, writes_at_last_int_ = 0;
+    uint64_t br_at_last_int_ = 0, bw_at_last_int_ = 0;
+
+    // knobs
+    bool     disable_stride_ = false;
+    uint64_t stride_cap_bytes_ = 1<<20;
+    uint64_t line_stride_cap_  = (1<<20) >> 6;
+};
+analysis_tool_t *rwstats_tool_create() { return new rwstats_tool_t(); }

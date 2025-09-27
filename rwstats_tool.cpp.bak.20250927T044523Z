@@ -1,0 +1,303 @@
+#include "drmemtrace/analysis_tool.h"
+#include "drmemtrace/memref.h"
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <algorithm>
+#include <limits>
+#include <string>
+
+using namespace dynamorio::drmemtrace;
+
+static inline double log2_safe(double x) {
+    return x > 0.0 ? log2(x) : 0.0;
+}
+
+class rwstats_tool_t : public analysis_tool_t {
+public:
+    rwstats_tool_t() {
+        // knobs
+        const char *s;
+        // snapshot interval (memrefs). If 0 -> only final
+        if ((s = getenv("RWSTATS_INTERVAL")) != nullptr)
+            interval_ = strtoull(s, nullptr, 10);
+        // stride cap in bytes (percentiles computed on clamped values)
+        if ((s = getenv("RWSTATS_STRIDE_CAP_BYTES")) != nullptr)
+            stride_cap_B_ = strtoull(s, nullptr, 10);
+        // compute footprint90 at intervals (1) or final-only (0)
+        if ((s = getenv("RWSTATS_F90_INTERVAL")) != nullptr)
+            f90_interval_ = (atoi(s) != 0);
+        // bits to mask for "local" entropy (page-ish locality)
+        if ((s = getenv("RWSTATS_LOCAL_BITS")) != nullptr)
+            local_bits_ = std::max(0, atoi(s));
+        // address granularity shift (0=bytes, 6=64B lines)
+        if ((s = getenv("RWSTATS_ADDR_SHIFT")) != nullptr)
+            addr_shift_ = std::max(0, atoi(s));
+    }
+
+    // ---- analysis_tool_t API ----
+    bool process_memref(const memref_t &m) override {
+        trace_type_t t = m.data.type;
+        // Only handle actual data refs here
+        if (t != TRACE_TYPE_READ && t != TRACE_TYPE_WRITE)
+            return true;
+
+        const uint64_t bytes = (uint64_t)m.data.size;
+        const uint64_t addr_key = (uint64_t)(m.data.addr) >> addr_shift_;
+        const uint64_t line_tag = addr_key;                   // if shift==6 this is line; else "gran" tag
+        const uint64_t page_tag = addr_key >> 6;              // 64 lines per 4KB page when shift==6
+
+        // ----- totals -----
+        total_refs_++;
+        if (t == TRACE_TYPE_READ) { reads_++;  bytes_read_  += bytes; }
+        else                      { writes_++; bytes_written_ += bytes; }
+
+        // ----- per-type frequency maps (for entropy/footprint90/unique) -----
+        if (t == TRACE_TYPE_READ) {
+            read_freq_interval_[addr_key]++;   read_freq_final_[addr_key]++;
+            read_local_freq_interval_[addr_key & ~((1ULL << local_bits_) - 1)]++;
+            read_local_freq_final_[addr_key & ~((1ULL << local_bits_) - 1)]++;
+        } else {
+            write_freq_interval_[addr_key]++;  write_freq_final_[addr_key]++;
+            write_local_freq_interval_[addr_key & ~((1ULL << local_bits_) - 1)]++;
+            write_local_freq_final_[addr_key & ~((1ULL << local_bits_) - 1)]++;
+        }
+
+        // ----- footprint (unique lines/pages in the current interval) -----
+        uniq_lines_interval_.insert(line_tag);
+        uniq_pages_interval_.insert(page_tag);
+
+        // ----- stride stats (bytes + "lines") -----
+        if (have_prev_) {
+            int64_t sb = (int64_t)addr_key - (int64_t)prev_addr_key_;
+            uint64_t abs_sb = (uint64_t)(sb >= 0 ? sb : -sb);
+            // "byte-stride" measured in underlying granularity units, convert ~bytes by << addr_shift_
+            uint64_t strideB = (abs_sb << addr_shift_);
+            uint64_t strideL = abs_sb; // already in "granularity lines"
+            // cap for percentile dists
+            uint64_t b_c = std::min<uint64_t>(strideB, stride_cap_B_);
+            uint64_t l_c = std::min<uint64_t>(strideL, (stride_cap_B_ >> addr_shift_));
+            // interval hist
+            strideB_hist_interval_[b_c]++;
+            strideL_hist_interval_[l_c]++;
+            // final hist
+            strideB_hist_final_[b_c]++;
+            strideL_hist_final_[l_c]++;
+            // for averages & <=64
+            sum_strideB_interval_ += (double)strideB;
+            sum_strideL_interval_ += (double)strideL;
+            stride_pairs_interval_++;
+            if (strideB <= 64) stride_le_64_interval_++;
+        } else {
+            have_prev_ = true;
+        }
+        prev_addr_key_ = addr_key;
+
+        // ---- periodic snapshot ----
+        if (interval_ > 0 && (total_refs_ % interval_ == 0))
+            print_snapshot("interval", /*final=*/false);
+
+        return true;
+    }
+
+    bool print_results() override {
+        print_snapshot("final", /*final=*/true);
+        return true;
+    }
+
+private:
+    // ================= helpers =================
+    static double entropy_from_map(const std::unordered_map<uint64_t,uint64_t> &mp, uint64_t total) {
+        if (total == 0 || mp.empty()) return std::numeric_limits<double>::quiet_NaN();
+        double H = 0.0;
+        for (auto &kv : mp) {
+            double p = (double)kv.second / (double)total;
+            H -= p * log2_safe(p);
+        }
+        return H;
+    }
+
+    static uint64_t footprint90_from_map(const std::unordered_map<uint64_t,uint64_t> &mp, uint64_t total) {
+        if (total == 0 || mp.empty()) return 0;
+        std::vector<uint64_t> v; v.reserve(mp.size());
+        for (auto &kv : mp) v.push_back(kv.second);
+        std::sort(v.begin(), v.end(), std::greater<uint64_t>());
+        uint64_t need = (uint64_t)std::ceil(0.9 * (double)total);
+        uint64_t acc = 0;
+        size_t k = 0;
+        for (; k < v.size(); ++k) { acc += v[k]; if (acc >= need) break; }
+        return (uint64_t)(k + 1);
+    }
+
+    static uint64_t pctile_from_hist(const std::unordered_map<uint64_t,uint64_t> &hist, uint64_t total, double q) {
+        if (total == 0 || hist.empty()) return 0;
+        // collect keys, sort ascending
+        std::vector<uint64_t> keys; keys.reserve(hist.size());
+        for (auto &kv : hist) keys.push_back(kv.first);
+        std::sort(keys.begin(), keys.end());
+        uint64_t target = (uint64_t)std::ceil(q * (double)total);
+        uint64_t acc = 0;
+        for (uint64_t k : keys) {
+            acc += hist.at(k);
+            if (acc >= target) return k;
+        }
+        return keys.back();
+    }
+
+    void reset_interval() {
+        uniq_lines_interval_.clear();
+        uniq_pages_interval_.clear();
+        read_freq_interval_.clear();
+        write_freq_interval_.clear();
+        read_local_freq_interval_.clear();
+        write_local_freq_interval_.clear();
+        strideB_hist_interval_.clear();
+        strideL_hist_interval_.clear();
+        sum_strideB_interval_ = 0.0;
+        sum_strideL_interval_ = 0.0;
+        stride_pairs_interval_ = 0;
+        stride_le_64_interval_ = 0;
+    }
+
+    void print_snapshot(const char *scope, bool is_final) {
+        // choose interval vs final views
+        const auto &rf = is_final ? read_freq_final_       : read_freq_interval_;
+        const auto &wf = is_final ? write_freq_final_      : write_freq_interval_;
+        const auto &rl = is_final ? read_local_freq_final_ : read_local_freq_interval_;
+        const auto &wl = is_final ? write_local_freq_final_: write_local_freq_interval_;
+
+        const auto &hB = is_final ? strideB_hist_final_ : strideB_hist_interval_;
+        const auto &hL = is_final ? strideL_hist_final_ : strideL_hist_interval_;
+
+        uint64_t read_total  = 0, write_total = 0;
+        for (auto &kv : rf) read_total  += kv.second;
+        for (auto &kv : wf) write_total += kv.second;
+
+        double read_entropy  = entropy_from_map(rf, read_total);
+        double write_entropy = entropy_from_map(wf, write_total);
+        double read_local_entropy  = entropy_from_map(rl, read_total);
+        double write_local_entropy = entropy_from_map(wl, write_total);
+
+        uint64_t read_f90  = (is_final || f90_interval_)  ? footprint90_from_map(rf, read_total) : 0;
+        uint64_t write_f90 = (is_final || f90_interval_)  ? footprint90_from_map(wf, write_total): 0;
+
+        // basic footprint (unique "lines"/"pages") over the *interval view*
+        uint64_t uniq_lines = is_final ? 0 : (uint64_t)uniq_lines_interval_.size();
+        uint64_t uniq_pages = is_final ? 0 : (uint64_t)uniq_pages_interval_.size();
+        uint64_t footprint_bytes = uniq_lines << addr_shift_;
+
+        // stride summaries from histogram
+        uint64_t stride_pairs = 0;
+        for (auto &kv : hB) stride_pairs += kv.second;
+
+        double avg_strideB = (stride_pairs > 0) ? (is_final ? avg_from_hist(hB) : (sum_strideB_interval_ / (double)stride_pairs)) : std::numeric_limits<double>::quiet_NaN();
+        double avg_strideL = (stride_pairs > 0) ? (is_final ? avg_from_hist(hL) : (sum_strideL_interval_ / (double)stride_pairs)) : std::numeric_limits<double>::quiet_NaN();
+
+        double p_le_64 = (stride_pairs > 0) ? (double)stride_le_64_interval_ / (double)stride_pairs : std::numeric_limits<double>::quiet_NaN();
+
+        uint64_t p50B = pctile_from_hist(hB, stride_pairs, 0.50);
+        uint64_t p90B = pctile_from_hist(hB, stride_pairs, 0.90);
+        uint64_t p99B = pctile_from_hist(hB, stride_pairs, 0.99);
+        uint64_t p50L = pctile_from_hist(hL, stride_pairs, 0.50);
+        uint64_t p90L = pctile_from_hist(hL, stride_pairs, 0.90);
+        uint64_t p99L = pctile_from_hist(hL, stride_pairs, 0.99);
+
+        // reuse rate (simple): 1 - uniq_lines / total_refs_in_scope (interval view only)
+        double reuse_rate = std::numeric_limits<double>::quiet_NaN();
+        if (!is_final) {
+            uint64_t tot = (uint64_t)(read_total + write_total);
+            if (tot > 0) reuse_rate = 1.0 - ((double)uniq_lines / (double)tot);
+        }
+
+        // print one compact CSV-ish line (extend existing schema)
+        // Note: keep names stable; appended new fields at the end.
+        fprintf(stdout,
+            "scope=%s"
+            ",reads=%" PRIu64 ",writes=%" PRIu64
+            ",bytes_read=%" PRIu64 ",bytes_written=%" PRIu64
+            ",uniq_lines=%" PRIu64 ",uniq_pages=%" PRIu64 ",footprint_bytes=%" PRIu64
+            ",H_line=%.6f,H_page=%.6f,H_stride=%s"
+            ",reuse_rate=%s,avg_stride=%s,avg_line_stride=%s,p_stride_le_64=%s"
+            ",p50_strideB=%" PRIu64 ",p90_strideB=%" PRIu64 ",p99_strideB=%" PRIu64
+            ",p50_strideL=%" PRIu64 ",p90_strideL=%" PRIu64 ",p99_strideL=%" PRIu64
+            ",read_total=%" PRIu64 ",read_unique=%" PRIu64 ",read_entropy=%.6f,read_local_entropy=%.6f,read_footprint90=%" PRIu64
+            ",write_total=%" PRIu64 ",write_unique=%" PRIu64 ",write_entropy=%.6f,write_local_entropy=%.6f,write_footprint90=%" PRIu64
+            "\n",
+            scope,
+            reads_, writes_,
+            bytes_read_, bytes_written_,
+            uniq_lines, uniq_pages, footprint_bytes,
+            // H_line/page: derive from line/page distribution across interval (approx via sets -> entropy undefined). Keep NaNs for now.
+            std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
+            // H_stride: entropy of stride histogram (optional: compute quickly)
+            fmt_entropy_of_hist(hB).c_str(),
+            fmt_double(reuse_rate).c_str(), fmt_double(avg_strideB).c_str(), fmt_double(avg_strideL).c_str(), fmt_double(p_le_64).c_str(),
+            p50B, p90B, p99B, p50L, p90L, p99L,
+            read_total, (uint64_t)rf.size(), read_entropy, read_local_entropy, read_f90,
+            write_total, (uint64_t)wf.size(), write_entropy, write_local_entropy, write_f90
+        );
+
+        if (!is_final) reset_interval();
+    }
+
+    static std::string fmt_double(double v, const char *fmt="%.6f") {
+        if (std::isnan(v)) return std::string("nan");
+        char b[64]; snprintf(b, sizeof(b), fmt, v); return std::string(b);
+    }
+
+    static std::string fmt_entropy_of_hist(const std::unordered_map<uint64_t,uint64_t> &hist) {
+        uint64_t tot = 0; for (auto &kv : hist) tot += kv.second;
+        if (tot == 0) return "nan";
+        double H=0.0; for (auto &kv : hist){ double p=(double)kv.second/(double)tot; H -= p*log2_safe(p); }
+        char b[64]; snprintf(b,sizeof(b),"%.6f",H); return std::string(b);
+    }
+
+    static double avg_from_hist(const std::unordered_map<uint64_t,uint64_t> &hist) {
+        if (hist.empty()) return std::numeric_limits<double>::quiet_NaN();
+        long double num = 0.0, den = 0.0;
+        for (auto &kv : hist){ num += (long double)kv.first * (long double)kv.second; den += (long double)kv.second; }
+        if (den == 0.0) return std::numeric_limits<double>::quiet_NaN();
+        return (double)(num / den);
+    }
+
+private:
+    // knobs
+    uint64_t interval_      = 5000000ULL;
+    uint64_t stride_cap_B_  = 1ULL<<20; // 1 MiB default
+    bool     f90_interval_  = true;
+    int      local_bits_    = 10;
+    int      addr_shift_    = 0;
+
+    // totals
+    uint64_t total_refs_    = 0;
+    uint64_t reads_         = 0, writes_ = 0;
+    uint64_t bytes_read_    = 0, bytes_written_ = 0;
+
+    // per-interval uniqueness (granularity "lines"/"pages")
+    std::unordered_set<uint64_t> uniq_lines_interval_;
+    std::unordered_set<uint64_t> uniq_pages_interval_;
+
+    // per-type frequency maps (interval and final)
+    std::unordered_map<uint64_t,uint64_t> read_freq_interval_,  write_freq_interval_;
+    std::unordered_map<uint64_t,uint64_t> read_freq_final_,     write_freq_final_;
+    std::unordered_map<uint64_t,uint64_t> read_local_freq_interval_, write_local_freq_interval_;
+    std::unordered_map<uint64_t,uint64_t> read_local_freq_final_,    write_local_freq_final_;
+
+    // stride: last address (granularity key)
+    bool have_prev_ = false;
+    uint64_t prev_addr_key_ = 0;
+
+    // stride histograms (interval + final), averaged numbers
+    std::unordered_map<uint64_t,uint64_t> strideB_hist_interval_, strideB_hist_final_;
+    std::unordered_map<uint64_t,uint64_t> strideL_hist_interval_, strideL_hist_final_;
+    double   sum_strideB_interval_ = 0.0, sum_strideL_interval_ = 0.0;
+    uint64_t stride_pairs_interval_ = 0,  stride_le_64_interval_ = 0;
+};
+
+// factory
+analysis_tool_t *rwstats_tool_create() { return new rwstats_tool_t(); }
