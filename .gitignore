@@ -16,3 +16,4 @@ Makefile
 *.swp
 # misc
 .DS_Store
+.bak
