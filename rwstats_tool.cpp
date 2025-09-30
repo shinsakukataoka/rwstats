@@ -14,6 +14,9 @@
 
 using namespace dynamorio::drmemtrace;
 
+// Optional runtime helper
+static inline bool env_on(const char* k){ const char* s=getenv(k); return s && *s && s[0]!='0'; }
+
 // -------- helpers --------
 static inline uint64_t line_id(uint64_t addr) { return addr >> 6; }   // 64B lines
 static inline uint64_t page_id(uint64_t addr) { return addr >> 12; }  // 4KB pages
@@ -53,7 +56,56 @@ public:
 
     // --- analysis_tool_t required ---
     bool process_memref(const memref_t &m) override {
+        // --- version-safe flush-on-disable (ROI end) ---
+        if (m.data.type == TRACE_TYPE_MARKER) {
+            auto mt = m.marker.marker_type;
+
+            // Prefer modern FILTER_ENDPOINT; else fall back to other known enums; else runtime override.
+            bool win_off =
+#if defined(TRACE_MARKER_TYPE_FILTER_ENDPOINT)
+                (mt == TRACE_MARKER_TYPE_FILTER_ENDPOINT);
+#elif defined(TRACE_MARKER_TYPE_WINDOW_END)
+                (mt == TRACE_MARKER_TYPE_WINDOW_END);
+#elif defined(TRACE_MARKER_TYPE_TRACING_WINDOW_OFF)
+                (mt == TRACE_MARKER_TYPE_TRACING_WINDOW_OFF);
+#elif defined(TRACE_MARKER_TYPE_TRACING_OFF)
+                (mt == TRACE_MARKER_TYPE_TRACING_OFF);
+#else
+                false;
+#endif
+
+            if (!win_off) {
+                if (const char* fm = getenv("RWSTATS_FINAL_MARKER")) {
+                    win_off = ((int)mt == atoi(fm));
+                }
+            }
+
+            if (env_on("RWSTATS_MARKER_DEBUG")) {
+                fprintf(stderr, "[rwstats] marker type=%d val=%" PRIuPTR " win_off=%d\n",
+                        (int)mt, (uintptr_t)m.marker.marker_value, (int)win_off);
+                fflush(stderr); // ensure marker debug appears immediately
+            }
+
+            if (win_off && !final_emitted_on_disable_) {
+                if (interval_target_ == 0 && (reads_+writes_) > last_emit_total_) {
+                    emit_interval();
+                    clear_interval();
+                }
+                emit_final_snapshot();
+                final_emitted_on_disable_ = true;   // don’t double-print at process exit
+            }
+            return true; // handled marker
+        }
+
         const trace_type_t t = m.data.type;
+
+        // Count instructions (version-safe)
+#if defined(TRACE_TYPE_INSTR)
+        if (t == TRACE_TYPE_INSTR) { instrs_++; return true; }
+#elif defined(TRACE_TYPE_INSTRUCTION)
+        if (t == TRACE_TYPE_INSTRUCTION) { instrs_++; return true; }
+#endif
+
         if (t != TRACE_TYPE_READ && t != TRACE_TYPE_WRITE)
             return true;
 
@@ -64,9 +116,14 @@ public:
         if (t == TRACE_TYPE_READ) { reads_++;  bytes_read_  += sz; }
         else                      { writes_++; bytes_written_+= sz; }
 
+        const uint64_t lid = line_id(addr);
+
         // interval uniques
-        interval_lines_.insert(line_id(addr));
+        interval_lines_.insert(lid);
         interval_pages_.insert(page_id(addr));
+
+        // global unique lines (for running footprint)
+        global_lines_.insert(lid);
 
         // per-type interval uniques (addresses)
         if (t == TRACE_TYPE_READ) {
@@ -93,7 +150,6 @@ public:
 
         // final-only line-level per-type bookkeeping (unique & frequency -> 90% footprint)
         if (want_final_lines_) {
-            const uint64_t lid = line_id(addr);
             if (t == TRACE_TYPE_READ) { rd_lines_set_.insert(lid); rd_line_freq_[lid]++; }
             else                      { wr_lines_set_.insert(lid); wr_line_freq_[lid]++; }
         }
@@ -134,78 +190,15 @@ public:
     }
 
     bool print_results() override {
-        // ensure a last interval print if user set RWSTATS_INTERVAL=0
-        if (last_emit_total_ == 0 && (reads_+writes_) > 0 && interval_target_==0) {
-            emit_interval();
-            clear_interval();
+        if (!final_emitted_on_disable_) {
+            // ensure a last interval print if user set RWSTATS_INTERVAL=0
+            if (last_emit_total_ == 0 && (reads_+writes_) > 0 && interval_target_==0) {
+                emit_interval();
+                clear_interval();
+            }
+            emit_final_snapshot();
+            final_emitted_on_disable_ = true;
         }
-
-        // final-only line stats (unique + 90% footprint) on top of the usual final summary
-        uint64_t rd_uniqL = 0, wr_uniqL = 0, rd_fp90L = 0, wr_fp90L = 0;
-        if (want_final_lines_) {
-            rd_uniqL = (uint64_t)rd_lines_set_.size();
-            wr_uniqL = (uint64_t)wr_lines_set_.size();
-            rd_fp90L = footprint90_from_freq(rd_line_freq_, total_reads_seen());
-            wr_fp90L = footprint90_from_freq(wr_line_freq_, total_writes_seen());
-        }
-
-        // Reuse last computed interval aggregates as proxies for scope=final
-        // (we already printed interval snapshots; final carries totals)
-        const char *scope = "final";
-        double avgB = (stride_cnt_>0) ? (sum_strideB_/stride_cnt_) : NAN;
-        double avgL = (stride_cnt_>0) ? (sum_strideL_/stride_cnt_) : NAN;
-        double pLE64= (stride_cnt_>0) ? ((double)le64_cnt_/stride_cnt_) : NAN;
-
-        uint64_t p50B=0,p90B=0,p99B=0, p50L=0,p90L=0,p99L=0;
-        approx_percentiles(p50B,p90B,p99B,histB_, stride_cap_bytes_, true);
-        approx_percentiles(p50L,p90L,p99L,histL_, (1ull<<16), false);
-
-        // interval uniques at this moment
-        uint64_t uniq_lines = interval_lines_.size();
-        uint64_t uniq_pages = interval_pages_.size();
-        uint64_t fp_bytes   = uniq_lines * 64ull;
-
-        // address-entropy per interval proxy
-        double Hs = entropy_from_freq(stride_cnt_==0 ? empty_freq_ : stride_dummy_); // leave H_stride realistic below
-        // real stride entropy using byte histogram
-        Hs = entropy_from_hist(histB_);
-
-        // read/write interval counters and entropies
-        double Hrg=entropy_from_freq(rd_freq_), Hrl=entropy_from_freq(rd_local_freq_);
-        double Hwg=entropy_from_freq(wr_freq_), Hwl=entropy_from_freq(wr_local_freq_);
-
-        // reuse rate proxy (seen-before within interval)
-        double reuse = reuse_rate_proxy(rd_freq_, wr_freq_);
-
-        fprintf(stdout,
-            "scope=%s,reads=%" PRIu64 ",writes=%" PRIu64
-            ",bytes_read=%" PRIu64 ",bytes_written=%" PRIu64
-            ",uniq_lines=%" PRIu64 ",uniq_pages=%" PRIu64 ",footprint_bytes=%" PRIu64
-            ",H_line=%s,H_page=%s,H_stride=%.6f"
-            ",reuse_rate=%.6f,avg_stride=%s,avg_line_stride=%s,p_stride_le_64=%s"
-            ",p50_strideB=%" PRIu64 ",p90_strideB=%" PRIu64 ",p99_strideB=%" PRIu64
-            ",p50_strideL=%" PRIu64 ",p90_strideL=%" PRIu64 ",p99_strideL=%" PRIu64
-            ",stride_bytes_over_cap=%" PRIu64 ",line_stride_over_cap=%" PRIu64
-            ",read_total=%" PRIu64 ",read_unique=%" PRIu64 ",read_entropy=%.6f,read_local_entropy=%.6f,read_footprint90=%" PRIu64
-            ",write_total=%" PRIu64 ",write_unique=%" PRIu64 ",write_entropy=%.6f,write_local_entropy=%.6f,write_footprint90=%" PRIu64
-            "%s%s"
-            "\n",
-            scope, reads_, writes_,
-            bytes_read_, bytes_written_,
-            uniq_lines, uniq_pages, fp_bytes,
-            "nan","nan", Hs,
-            reuse,
-            fmt_double(avgB).c_str(), fmt_double(avgL).c_str(), fmt_double(pLE64).c_str(),
-            p50B,p90B,p99B, p50L,p90L,p99L,
-            stride_bytes_over_cap_, line_stride_over_cap_,
-            rd_total_interval_, (uint64_t)rd_addr_set_.size(), Hrg, Hrl, (uint64_t)0,
-            wr_total_interval_, (uint64_t)wr_addr_set_.size(), Hwg, Hwl, (uint64_t)0,
-            // optional final-only extras at the very end (if enabled)
-            want_final_lines_ ? ",read_unique_lines=" : "",
-            want_final_lines_ ? (fmt_u64(rd_uniqL)+",write_unique_lines="+fmt_u64(wr_uniqL)+
-                                 ",read_footprint90L="+fmt_u64(rd_fp90L)+
-                                 ",write_footprint90L="+fmt_u64(wr_fp90L)).c_str() : ""
-        );
         return true;
     }
 
@@ -213,6 +206,9 @@ private:
     // ----- state -----
     uint64_t reads_ = 0, writes_ = 0;
     uint64_t bytes_read_ = 0, bytes_written_ = 0;
+
+    // also track instructions (running total)
+    uint64_t instrs_ = 0;
 
     // interval knobs
     uint64_t interval_target_;
@@ -236,6 +232,9 @@ private:
     std::unordered_set<uint64_t> interval_lines_;
     std::unordered_set<uint64_t> interval_pages_;
 
+    // global uniques (for running footprint over whole run)
+    std::unordered_set<uint64_t> global_lines_;
+
     // per-type address stats (interval)
     std::unordered_map<uint64_t,uint32_t> rd_freq_, wr_freq_;
     std::unordered_map<uint64_t,uint32_t> rd_local_freq_, wr_local_freq_;
@@ -250,6 +249,9 @@ private:
     // dummies
     std::unordered_map<uint64_t,uint32_t> stride_dummy_;
     std::unordered_map<uint64_t,uint32_t> empty_freq_;
+
+    // guard to avoid double-printing final snapshot
+    bool final_emitted_on_disable_ = false;
 
     // ----- helpers -----
     uint64_t total_reads_seen()  const { return reads_; }
@@ -349,16 +351,27 @@ private:
         uint64_t uniq_lines = interval_lines_.size();
         uint64_t uniq_pages = interval_pages_.size();
         uint64_t fp_bytes   = uniq_lines * 64ull;
+        uint64_t global_fp_bytes = (uint64_t)global_lines_.size() * 64ull;
 
         double Hs  = entropy_from_hist(histB_);
         double Hrg = entropy_from_freq(rd_freq_), Hrl=entropy_from_freq(rd_local_freq_);
         double Hwg = entropy_from_freq(wr_freq_), Hwl=entropy_from_freq(wr_local_freq_);
         double reuse = reuse_rate_proxy(rd_freq_, wr_freq_);
 
+        // "final-only" per-type stats computed so far
+        uint64_t rd_uniqL = 0, wr_uniqL = 0, rd_fp90L = 0, wr_fp90L = 0;
+        if (want_final_lines_) {
+            rd_uniqL = (uint64_t)rd_lines_set_.size();
+            wr_uniqL = (uint64_t)wr_lines_set_.size();
+            rd_fp90L = footprint90_from_freq(rd_line_freq_, total_reads_seen());
+            wr_fp90L = footprint90_from_freq(wr_line_freq_, total_writes_seen());
+        }
+
         fprintf(stdout,
             "scope=%s,reads=%" PRIu64 ",writes=%" PRIu64
             ",bytes_read=%" PRIu64 ",bytes_written=%" PRIu64
             ",uniq_lines=%" PRIu64 ",uniq_pages=%" PRIu64 ",footprint_bytes=%" PRIu64
+            ",global_footprint_bytes=%" PRIu64
             ",H_line=%s,H_page=%s,H_stride=%.6f"
             ",reuse_rate=%.6f,avg_stride=%s,avg_line_stride=%s,p_stride_le_64=%s"
             ",p50_strideB=%" PRIu64 ",p90_strideB=%" PRIu64 ",p99_strideB=%" PRIu64
@@ -366,18 +379,28 @@ private:
             ",stride_bytes_over_cap=%" PRIu64 ",line_stride_over_cap=%" PRIu64
             ",read_total=%" PRIu64 ",read_unique=%" PRIu64 ",read_entropy=%.6f,read_local_entropy=%.6f,read_footprint90=%" PRIu64
             ",write_total=%" PRIu64 ",write_unique=%" PRIu64 ",write_entropy=%.6f,write_local_entropy=%.6f,write_footprint90=%" PRIu64
+            ",instrs=%" PRIu64
+            "%s%s"
             "\n",
             scope, reads_, writes_,
             bytes_read_, bytes_written_,
             uniq_lines, uniq_pages, fp_bytes,
+            global_fp_bytes,
             "nan","nan", Hs,
             reuse,
             fmt_double(avgB).c_str(), fmt_double(avgL).c_str(), fmt_double(pLE64).c_str(),
             p50B,p90B,p99B, p50L,p90L,p99L,
             stride_bytes_over_cap_, line_stride_over_cap_,
             rd_total_interval_, (uint64_t)rd_addr_set_.size(), Hrg, Hrl, (uint64_t)0,
-            wr_total_interval_, (uint64_t)wr_addr_set_.size(), Hwg, Hwl, (uint64_t)0
+            wr_total_interval_, (uint64_t)wr_addr_set_.size(), Hwg, Hwl, (uint64_t)0,
+            instrs_,
+            // optional extras: running final-only stats
+            want_final_lines_ ? ",read_unique_lines=" : "",
+            want_final_lines_ ? (fmt_u64(rd_uniqL)+",write_unique_lines="+fmt_u64(wr_uniqL)+
+                                 ",read_footprint90L="+fmt_u64(rd_fp90L)+
+                                 ",write_footprint90L="+fmt_u64(wr_fp90L)).c_str() : ""
         );
+        fflush(stdout); // ensure interval line hits the log immediately
         last_emit_total_ = reads_+writes_;
     }
 
@@ -397,6 +420,83 @@ private:
         have_last_ = false;
         last_addr_ = 0;
     }
+
+    // Factorized final snapshot printer (reused by ROI-end marker and print_results)
+    void emit_final_snapshot() {
+        // final-only line stats (unique + 90% footprint) on top of the usual final summary
+        uint64_t rd_uniqL = 0, wr_uniqL = 0, rd_fp90L = 0, wr_fp90L = 0;
+        if (want_final_lines_) {
+            rd_uniqL = (uint64_t)rd_lines_set_.size();
+            wr_uniqL = (uint64_t)wr_lines_set_.size();
+            rd_fp90L = footprint90_from_freq(rd_line_freq_, total_reads_seen());
+            wr_fp90L = footprint90_from_freq(wr_line_freq_, total_writes_seen());
+        }
+
+        // Reuse last computed interval aggregates as proxies for scope=final
+        // (we already printed interval snapshots; final carries totals)
+        const char *scope = "final";
+        double avgB = (stride_cnt_>0) ? (sum_strideB_/stride_cnt_) : NAN;
+        double avgL = (stride_cnt_>0) ? (sum_strideL_/stride_cnt_) : NAN;
+        double pLE64= (stride_cnt_>0) ? ((double)le64_cnt_/stride_cnt_) : NAN;
+
+        uint64_t p50B=0,p90B=0,p99B=0, p50L=0,p90L=0,p99L=0;
+        approx_percentiles(p50B,p90B,p99B,histB_, stride_cap_bytes_, true);
+        approx_percentiles(p50L,p90L,p99L,histL_, (1ull<<16), false);
+
+        // interval uniques at this moment
+        uint64_t uniq_lines = interval_lines_.size();
+        uint64_t uniq_pages = interval_pages_.size();
+        uint64_t fp_bytes   = uniq_lines * 64ull;
+        uint64_t global_fp_bytes = (uint64_t)global_lines_.size() * 64ull;
+
+        // address-entropy per interval proxy
+        double Hs = entropy_from_freq(stride_cnt_==0 ? empty_freq_ : stride_dummy_); // leave H_stride realistic below
+        // real stride entropy using byte histogram
+        Hs = entropy_from_hist(histB_);
+
+        // read/write interval counters and entropies
+        double Hrg=entropy_from_freq(rd_freq_), Hrl=entropy_from_freq(rd_local_freq_);
+        double Hwg=entropy_from_freq(wr_freq_), Hwl=entropy_from_freq(wr_local_freq_);
+
+        // reuse rate proxy (seen-before within interval)
+        double reuse = reuse_rate_proxy(rd_freq_, wr_freq_);
+
+        fprintf(stdout,
+            "scope=%s,reads=%" PRIu64 ",writes=%" PRIu64
+            ",bytes_read=%" PRIu64 ",bytes_written=%" PRIu64
+            ",uniq_lines=%" PRIu64 ",uniq_pages=%" PRIu64 ",footprint_bytes=%" PRIu64
+            ",global_footprint_bytes=%" PRIu64
+            ",H_line=%s,H_page=%s,H_stride=%.6f"
+            ",reuse_rate=%.6f,avg_stride=%s,avg_line_stride=%s,p_stride_le_64=%s"
+            ",p50_strideB=%" PRIu64 ",p90_strideB=%" PRIu64 ",p99_strideB=%" PRIu64
+            ",p50_strideL=%" PRIu64 ",p90_strideL=%" PRIu64 ",p99_strideL=%" PRIu64
+            ",stride_bytes_over_cap=%" PRIu64 ",line_stride_over_cap=%" PRIu64
+            ",read_total=%" PRIu64 ",read_unique=%" PRIu64 ",read_entropy=%.6f,read_local_entropy=%.6f,read_footprint90=%" PRIu64
+            ",write_total=%" PRIu64 ",write_unique=%" PRIu64 ",write_entropy=%.6f,write_local_entropy=%.6f,write_footprint90=%" PRIu64
+            ",instrs=%" PRIu64
+            "%s%s"
+            "\n",
+            scope, reads_, writes_,
+            bytes_read_, bytes_written_,
+            uniq_lines, uniq_pages, fp_bytes,
+            global_fp_bytes,
+            "nan","nan", Hs,
+            reuse,
+            fmt_double(avgB).c_str(), fmt_double(avgL).c_str(), fmt_double(pLE64).c_str(),
+            p50B,p90B,p99B, p50L,p90L,p99L,
+            stride_bytes_over_cap_, line_stride_over_cap_,
+            rd_total_interval_, (uint64_t)rd_addr_set_.size(), Hrg, Hrl, (uint64_t)0,
+            wr_total_interval_, (uint64_t)wr_addr_set_.size(), Hwg, Hwl, (uint64_t)0,
+            instrs_,
+            // optional final-only extras at the very end (if enabled)
+            want_final_lines_ ? ",read_unique_lines=" : "",
+            want_final_lines_ ? (fmt_u64(rd_uniqL)+",write_unique_lines="+fmt_u64(wr_uniqL)+
+                                 ",read_footprint90L="+fmt_u64(rd_fp90L)+
+                                 ",write_footprint90L="+fmt_u64(wr_fp90L)).c_str() : ""
+        );
+        fflush(stdout); // ensure final line hits the log immediately
+    }
 };
 
 analysis_tool_t *rwstats_tool_create() { return new rwstats_tool_t(); }
+
