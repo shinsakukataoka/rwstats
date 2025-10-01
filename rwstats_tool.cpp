@@ -1,6 +1,5 @@
 #include "drmemtrace/analysis_tool.h"
 #include "drmemtrace/memref.h"
-
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,10 +13,7 @@
 
 using namespace dynamorio::drmemtrace;
 
-// Optional runtime helper
 static inline bool env_on(const char* k){ const char* s=getenv(k); return s && *s && s[0]!='0'; }
-
-// -------- helpers --------
 static inline uint64_t line_id(uint64_t addr) { return addr >> 6; }   // 64B lines
 static inline uint64_t page_id(uint64_t addr) { return addr >> 12; }  // 4KB pages
 static inline uint64_t iabs64(int64_t x){ return x < 0 ? -x : x; }
@@ -99,7 +95,6 @@ public:
 
         const trace_type_t t = m.data.type;
 
-        // Count instructions (version-safe)
 #if defined(TRACE_TYPE_INSTR)
         if (t == TRACE_TYPE_INSTR) { instrs_++; return true; }
 #elif defined(TRACE_TYPE_INSTRUCTION)
@@ -358,7 +353,6 @@ private:
         double Hwg = entropy_from_freq(wr_freq_), Hwl=entropy_from_freq(wr_local_freq_);
         double reuse = reuse_rate_proxy(rd_freq_, wr_freq_);
 
-        // "final-only" per-type stats computed so far
         uint64_t rd_uniqL = 0, wr_uniqL = 0, rd_fp90L = 0, wr_fp90L = 0;
         if (want_final_lines_) {
             rd_uniqL = (uint64_t)rd_lines_set_.size();
@@ -432,8 +426,6 @@ private:
             wr_fp90L = footprint90_from_freq(wr_line_freq_, total_writes_seen());
         }
 
-        // Reuse last computed interval aggregates as proxies for scope=final
-        // (we already printed interval snapshots; final carries totals)
         const char *scope = "final";
         double avgB = (stride_cnt_>0) ? (sum_strideB_/stride_cnt_) : NAN;
         double avgL = (stride_cnt_>0) ? (sum_strideL_/stride_cnt_) : NAN;
@@ -443,7 +435,6 @@ private:
         approx_percentiles(p50B,p90B,p99B,histB_, stride_cap_bytes_, true);
         approx_percentiles(p50L,p90L,p99L,histL_, (1ull<<16), false);
 
-        // interval uniques at this moment
         uint64_t uniq_lines = interval_lines_.size();
         uint64_t uniq_pages = interval_pages_.size();
         uint64_t fp_bytes   = uniq_lines * 64ull;
